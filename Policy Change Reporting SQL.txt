@@ -1,0 +1,396 @@
+-- =============================================================================================================================================================================
+-- =============================================================================================================================================================================
+--                                                                              TXN LEVEL - GBP
+-- =============================================================================================================================================================================
+-- =============================================================================================================================================================================
+
+-- This code is to obtain specific transactions which were Out of Policy (OOP) for a specific period. 
+
+-- Want to get the original date of the store order when the sale was made. For store orders, it is still in policy within 42 days, but for non store orders, this is OOP. 
+
+WITH store_orders AS ( 
+
+SELECT 
+        ofpem.orderid, -- this is the original sale orderid
+        ofpem.ext_pos,
+		ofpem.ext_tcpl
+        
+FROM RI_NGBI_DB.published_data.opd_full_pos_externals_mvw_v ofpem
+
+WHERE ofpem.ext_tcpl IS NOT NULL -- Where this is null, this is a store order
+
+),
+
+-- Next, is item exchanges. These do not count at OOP regardless of time period.
+
+exchanged as (
+
+select
+
+    ofpm.orderid,
+    sum(item_netprice) exchange_value
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_MVW" ofpm
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_ITEMS_MVW" ofpim
+on ofpim.orderid = ofpm.orderid
+
+where ord_ordertype = 'POS-EXCHANGE'
+and ofpim.item_itemstatus = 'RETURNED_TO_STORE'
+
+group by ofpm.orderid
+),
+
+-- Where there were multiple refunds, we need to get the items that were returned in policy and the ones that were not returned in policy
+
+multiple_refunds_items as (
+
+select
+
+    ofpim.orderid                                                                                           refund_orderid,
+    ofpm_ref.ord_transactionnumber                                                                          refund_transaction_number,                    
+    ofpm_sale.orderid                                                                                       original_sale_orderid,
+    ofpm_sale.ord_transactionnumber                                                                         originalsales_transaction_number, 
+    ofpm_ref.loc_storeid                                                                                    refund_location_id,
+    ofpm_sale.loc_storeid                                                                                   original_sale_location_id,
+    ofpim._item_pos,
+    ofpim.item_skuid,
+    date_trunc('DAY',ofpm_sale.ord_ordercompleteddate)                                                      original_sale_date, -- Converting into date without the time
+    date_trunc('DAY',ofpm_ref.ord_ordercompleteddate)                                                       refund_date,
+    datediff('DAY',original_sale_date,refund_date)                                                          time_frame,
+    case when ofpm_sale.orderid = so.orderid then 'Y' else 'N' end                                          store_order_flag,  -- A flag that shows if the transaction is a store order or not
+    case when time_frame <= 31 then 'N' 
+         when time_frame Between 31 and 42 and store_order_flag = 'Y' then 'N'
+         else 'Y' end                                                                                       OOP_flag, -- To flag if the transaction is OOP or not using the store order flag and time frame 
+    ofpim.item_quantity,
+    ofpim.item_netprice
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_ITEMS_MVW" ofpim
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_MVW" ofpm_ref -- To get the refund details
+on ofpm_ref.orderid  = ofpim.orderid
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_MVW" ofpm_sale -- To get the original sale details
+on ofpm_sale.orderid  = ofpim.item_loc_transactionid
+
+left join store_orders so 									-- Some customers could have store orders and non-store orders so left join rather than inner join
+on so.orderid = ofpim.item_loc_transactionid
+
+where
+
+ofpim.item_itemstatus = 'RETURNED_TO_STORE'
+and ofpm_ref.ord_ordertype = 'POS-RETURN'
+and ofpm_sale.ord_ordertype not in ('POS-NO-SALE','POS-FULL-VOID') -- These are not transactions
+
+group by 
+
+    refund_orderid,
+    ofpm_ref.ord_transactionnumber,  
+    original_sale_orderid,
+    originalsales_transaction_number,   
+    ofpm_ref.loc_storeid,
+    ofpm_sale.loc_storeid, 
+    ofpim._item_pos,
+    ofpim.item_skuid,
+    original_sale_date,
+    refund_date,
+    time_frame,
+    ofpim.item_quantity,
+    ofpim.item_netprice,
+    store_order_flag
+    
+order by
+
+    refund_orderid,
+    ofpim._item_pos
+),
+
+-- Now summarising the above table to order level. This says for each order, the number of items and value of anything that was OOP
+
+OOP_items as (
+
+Select
+
+    refund_orderid,
+    sum(item_quantity)    total_quantity_items,
+    sum(item_netprice)    total_item_value
+
+from multiple_refunds_items
+
+where OOP_flag = 'Y'
+
+group by 
+
+    refund_orderid
+
+),
+
+-- For some refunds, the refund amount can be issued in multiple ways. For OOP transactions, Giftcards are fine but anything to cash or card is not. 
+
+multiple_refunds_payments as (
+
+select
+
+    ofppm.orderid,
+    datediff('DAY',ofpm_sale.ord_ordercompleteddate,ofpm_ref.ord_ordercompleteddate)       time_frame,
+    ofppm.pay_type                                                                         Payment_method,
+    case when ofppm.pay_type = 'EGC' and OOP_flag = 'Y' then OOP_items.total_item_value 
+         when OOP_flag = 'N' then OOP_items.total_item_value 
+         else 0 end                                                                        In_Policy_Amount_Ex_Exchange           
+
+from "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_PAYMENTS_MVW" ofppm
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_PAYMENT_TRANS_MVW" ofpptm
+on (ofppm.orderid = ofpptm.orderid
+and ofppm._pay_pos = ofpptm._pay_pos)
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_MVW" ofpm_ref
+on ofpm_ref.orderid = ofppm.orderid
+
+join (select distinct 			
+
+            ofpim_ref.orderid      refund_orderid,
+            ofpim_sale.orderid     original_sale_orderid
+
+       from "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_ITEMS_MVW" ofpim_ref
+       
+       join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_ITEMS_MVW" ofpim_sale
+       on ofpim_ref.item_loc_transactionid = ofpim_sale.orderid
+       
+       where ofpim_ref.item_itemstatus = 'RETURNED_TO_STORE'
+       and ofpim_sale.item_itemstatus in ('NEW', 'DISPATCHED')
+      ) as sale_refund 																	-- This subquery gets the refund order id and the corresponding original sale order id. This enables you to find the time difference between the sale and refund. 
+on sale_refund.refund_orderid = ofppm.orderid
+
+join "RI_NGBI_DB"."PUBLISHED_DATA"."OPD_FULL_POS_MVW" ofpm_sale
+on ofpm_sale.orderid = sale_refund.original_sale_orderid
+
+join OOP_items
+on OOP_items.refund_orderid = ofppm.orderid
+
+join multiple_refunds_items mri
+on mri.refund_orderid = ofppm.orderid
+
+where ofpptm.pay_trans_type = 'REFUND'
+
+group by 
+
+    ofppm.orderid,
+    ofppm.pay_type, 
+    time_frame,
+    OOP_items.total_item_value,
+    In_Policy_Amount_Ex_Exchange,
+    ofpm_sale.ord_ordercompleteddate,
+    ofpm_ref.ord_ordercompleteddate
+
+),
+
+-- Getting the amount of money refunded that was OOP from the previous CTE.
+
+OOP_Amount as (
+
+select distinct 
+
+    mrp.orderid,
+    OOP_items.total_item_value                                                                                                           Total_Refunded_OOP,
+    Total_Refunded_OOP - mrp.In_Policy_Amount_Ex_Exchange                                                                                OOP_Amount_Ex_Exchange,
+    case when exchanged.orderid = mrp.orderid then OOP_Amount_Ex_Exchange - exchanged.exchange_value else OOP_Amount_Ex_Exchange end     OOP_Amount
+
+from multiple_refunds_payments mrp
+
+join OOP_items
+on OOP_items.refund_orderid = mrp.orderid
+
+left join exchanged
+on exchanged.orderid = mrp.orderid
+
+having OOP_Amount <> 0
+),
+
+ -- A refund on to a gift card or refund card is acceptable. EGC is used for both gift card and refund card. 
+ 
+non_EGC_refunds as(
+
+select
+        ofppm.orderid,
+        ofppm.pay_type                                                                                                                                     Payment_Method,
+        ofppgm.gift_cardnumber                                                                                                                             GiftCard_Number,
+        sum(ofppm.pay_amount)                                                                                                                              Total_refund_value,
+        sum(iff(ofppm.pay_type in('ELECTRON','MASTERCARD_DEBIT','VISA_DEBIT','FLEXECASH','MAESTRO','AMEX','MASTERCARD','VISA','CASH'),ofppm.pay_amount,0)) Non_EGC_refund_value,                     
+        sum(iff(ofppm.pay_type = 'EGC',ofppm.pay_amount,0))                                                                                                EGC_refund_value,
+        ret_items.return_item_count                                                                                                                        tot_ret_items,
+        total_refund_value / tot_ret_items / 100                                                                                                           ave_total_refund_value,
+        Non_EGC_refund_value / tot_ret_items / 100                                                                                                         ave_non_EGC_refund_value,
+        EGC_refund_value / tot_ret_items / 100                                                                                                             ave_ref_EGC_refund_value      
+        
+    from
+                    RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_PAYMENTS_MVW         ofppm
+      
+    
+        join   RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_PAYMENT_TRANS_MVW    ofpptm
+        on      (ofpptm.orderid = ofppm.orderid
+        and      ofpptm._pay_pos  = ofppm._pay_pos)
+        left join   RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_PAYMENT_GIFTS_MVW    ofppgm --Not every payment is done on a giftcard therefore get all
+        on      (ofppgm.orderid = ofppm.orderid
+        and      ofppgm._pay_pos = ofppm._pay_pos)
+        join    (   select 
+                        ofpim.orderid,
+                        count(ofpim.orderid)                                             return_item_count                     
+                    from 
+                        RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_ITEMS_MVW        ofpim
+                    where
+                        ofpim.item_itemstatus = 'RETURNED_TO_STORE'
+                    group by
+                        ofpim.orderid
+                    )                                                           ret_items
+        on      ret_items.orderid = ofppm.orderid
+      
+    where
+            ofpptm.pay_trans_type = 'REFUND'
+
+  group by
+        ofppm.orderid,
+        Payment_Method,
+        GiftCard_Number,
+        tot_ret_items
+  )
+
+-- Final output statement
+
+  select
+            dtm.fin_yr_wk                                                                                                                           fin_year_week,
+            dtm.cal_dt                                                                                                                              calendar_date,
+            dmo.location_id                                                                                                                         store_number,
+            dmo.location_descr                                                                                                                      store_name,
+            dmo.area_descr                                                                                                                          Market,
+            dmo.district_descr                                                                                                                      Territory,
+            ofpm.ord_agentid                                                                                                                        employee_id,
+            concat(re.firstname,' ',re.lastname)                                                                                                    employee_name,
+            ofpm.loc_terminalid                                                                                                                     till_number,
+            ofpm.ord_transactionnumber                                                                                                              transaction_number,
+            irer.description                                                                                                                        return_reason_description,
+            case when ofpm.ord_ordertype IN ('POS-STORE-MIXED','POS-EXCHANGE') then 'Exchange'
+             when ofpm.ord_ordertype = 'POS-RETURN' then 'Refund'
+             else null
+             end                                                                                                                                    type_of_refund, 
+            case when all_returns.item_loc_transactionid = so.orderid then 'Y' else 'N' end                                                         store_order_flag,
+            case when timediff('DAYS',all_returns.original_sale_date,ofpm.ord_orderplacedlocaldate) <= 28 
+                then '1_ 28 Days or less'
+            when timediff('DAYS',all_returns.original_sale_date,ofpm.ord_orderplacedlocaldate) <= 31 
+                then '2_ 31 Days or less'
+            when timediff('DAYS',all_returns.original_sale_date,ofpm.ord_orderplacedlocaldate) > 31 and store_order_flag = 'N'
+                then '3_ Over 31 Days'
+            when timediff('DAYS',all_returns.original_sale_date,ofpm.ord_orderplacedlocaldate) > 42 and store_order_flag = 'Y'
+                then '4_ Over 42 Days_ Store Order'
+            else 'No original receipt'
+            END                                                                                                                                     time_frame, --So that you can filter out in policy transactions.
+            max(non_EGC_refunds.Payment_Method)                                                                                                 	Refund_Payment_Method,
+            OOP_items.total_quantity_items                                                                                                      	quantity_returned_items,
+            oa.OOP_Amount                                                                                                                       	total_value_refunds_OOP
+        
+            from RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_MVW                     ofpm
+
+            join    RI_NGBI_DB.PUBLISHED_DATA.DIM_ORG                           dmo
+            on      ofpm.loc_storeid = dmo.location_id
+            
+            join    RI_NGBI_DB.PUBLISHED_DATA.dim_time                          dtm
+            on      date_trunc(DAY,ofpm.ord_orderplacedlocaldate) = dtm.cal_dt
+
+            join ri_people_db_prod.published_data.ri_employees re
+            on ofpm.ord_agentid = re.employeeid
+            
+            join    (select
+            
+                        ofpim.orderid,
+                        item_loc_transactionid, 
+                        date_trunc('DAY',ofpm_original.ord_ordercompleteddate) original_sale_date,
+                        item_itemstatus,
+                        max(item_pricestatus)                           price_status,         -- sku on a single reciept... but: belt and braces
+                        item_returncode,
+                        item_skuid,
+                        sum(item_quantity)                              tot_item_qty,
+                        sum(item_netprice)                              tot_item_value
+    
+                    from
+                        RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_ITEMS_MVW ofpim
+
+                    left join    RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_MVW             ofpm_original
+                    on      ofpm_original.orderid = ofpim.item_loc_transactionid
+
+                    where ofpim.item_itemstatus = 'RETURNED_TO_STORE'
+    
+                    group by
+                            ofpim.orderid,
+                            item_loc_transactionid,
+                            original_sale_date,
+                            item_itemstatus,
+                            item_returncode,
+                            item_skuid
+                            ) as all_returns                                 
+            on      all_returns.orderid = ofpm.orderid
+
+            left join "RI_SANDL_DB"."RAW_DATA"."ENACTOR_REASONS"                  irer		-- To get return reasons so that we know if if this unsuitables or faulty.
+            on        irer.reason = all_returns.item_returncode
+            
+            join NON_EGC_REFUNDS
+            on      non_egc_refunds.orderid = ofpm.orderid
+
+            join    RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_PAYMENTS_MVW         ofppm
+            on      ofpm.orderid = ofppm.orderid
+
+            left join   RI_NGBI_DB.PUBLISHED_DATA.OPD_FULL_POS_PAYMENT_TRANS_MVW    ofpptm -- To get payment types
+            on      ofpptm.orderid = ofppm.orderid
+            and ofpptm._pay_pos = ofppm._pay_pos
+
+            left join store_orders so
+            on so.orderid = all_returns.item_loc_transactionid
+            
+            join "RI_SANDL_DB"."RAW_DATA"."LU_LOCATION_ID_RRM_CLOSED"        rrmc 				-- Only interested in stores which are open. 
+            on ofpm.loc_storeid = rrmc.storenumber
+
+            join OOP_Amount oa
+            on oa.orderid = ofpm.orderid
+
+            join OOP_items
+            on OOP_items.refund_orderid = ofpm.orderid
+
+            where irer.description NOT IN ('Reverse Transaction', 'Full Price Staff Purchase')
+            and dmo.region_id = 50
+            and dmo.currency_id = 'GBP'
+            and ofpm.ord_currency = 'GBP'
+            and dtm.fin_yr_pd = 202312
+            and dmo.location_id not in ('891', '308') --These are franchise stores. 
+            and rrmc.closed is null 
+            and ofpptm.pay_trans_type = 'REFUND'
+            and time_frame in ('3_ Over 31 Days', '4_ Over 42 Days_ Store Order')
+            and irer.description NOT LIKE '%Receipt Not Recognised%'
+            and return_reason_description ilike '%Unsuitable%' 
+            and non_EGC_refunds.Payment_Method not like 'EGC'
+
+            group by
+                    
+                    fin_year_week,
+                    calendar_date,
+                    store_number,
+                    store_name,
+                    Market,
+                    Territory,
+                    employee_id,
+                    re.firstname,
+                    re.lastname,
+                    till_number,
+                    transaction_number,
+                    return_reason_description,
+                    type_of_refund,
+                    store_order_flag,
+                    time_frame,
+                    quantity_returned_items,
+                    oa.oop_amount
+
+            order by 
+                    fin_year_week,
+                    calendar_date,
+                    store_number,
+                    store_name,
+                    return_reason_description
+ ;
